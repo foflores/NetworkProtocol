@@ -2,9 +2,6 @@
 PACKET(32) --> | SYNFLAG(1) | ACKFLAG(1) | FINFLAG(1) | SEQNUM(7) | ACKNUM(7) | MSG(15) |
 """
 
-# TODO: add function to terminate connections properly
-# TODO: switch to acknowledging each packet
-
 import time
 import socket
 from threading import Thread
@@ -15,7 +12,7 @@ from math import ceil
 HEADERSIZE = 17
 MSGSIZE = 15
 PACKETSIZE = HEADERSIZE + MSGSIZE
-SERVER = ''
+SERVER = '127.0.0.1'
 
 receiveQueue = Queue()
 sendQueue = Queue()
@@ -25,7 +22,7 @@ sentBuffer = Queue()
 # Initiates connection to server
 def main():
 	server = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
-	server.connect(('192.168.1.109', 8050))
+	server.connect((SERVER, 8050))
 
 	connInfo = {'server': server, 'active': False, 'synSeq': randint(0, 9999990), 'ackSeq': 0}
 	handshake(connInfo)

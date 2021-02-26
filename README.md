@@ -1,4 +1,9 @@
 # Network Protocol
 ### CS499
 
-For this project I will be creating a custom transport layer protocol to implement a multi-client multi-server system which will later be integrated into another project.
+#### Use cases implemented:
+- initial handshake to establish connection
+- breaking down and recreating transmitted data into fixed packet sizes (assuming they are in order)
+- sending ACK after each message
+- retransmitting message if an ACK is not received (up to 3 times)
+- send and receive threads use buffers to allow control of data being sent and received
