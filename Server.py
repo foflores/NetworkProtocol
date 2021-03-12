@@ -1,180 +1,254 @@
 """
-PACKET(32) --> | SYNFLAG(1) | ACKFLAG(1) | FINFLAG(1) | SEQNUM(7) | ACKNUM(7) | MSG(15) |
+PACKET(42)
+| CHECKSUM(6) | SYNFLAG(1) | ACKFLAG(1) | FINFLAG(1) | BUFSIZE(2) | SYNNUM(7) | ACKNUM(7) | MSG(17)|
 """
-
 import time
 import socket
 from threading import Thread
 from random import randint
 from queue import Queue
 from math import ceil
+from math import floor
 
-HEADERSIZE = 17
-MSGSIZE = 15
+CHECKSUMSIZE = 6
+FLAGSIZE = 3
+BUFFERSIZE = 2
+SYNSIZE = 7
+ACKSIZE = 7
+MSGSIZE = 17
+
+HEADERSIZE = FLAGSIZE + BUFFERSIZE + SYNSIZE + ACKSIZE
 PACKETSIZE = HEADERSIZE + MSGSIZE
+
+SYN = '100'
+ACK = '010'
+SYNACK = '110'
+DATA = '000'
+
 HOST = (socket.gethostbyname(socket.gethostname()), 8050)
 
-sendQueue = Queue()
-receiveQueue = Queue()
-sentBuffer = Queue()
+rawMsgOut = Queue()
+msgOut = []
+ackIn = dict()
+msgIn = dict()
+rawMsgIn = Queue()
+connInfo = dict()
 
-# Starts server and listens for connections
-def main():
+def startServer():
 	myServer = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
 	myServer.bind(HOST)
 	myServer.listen()
 	while True:
-		client, address = myServer.accept()
-		clientThread = Thread(target=client_handler, args=((client, address)))
-		clientThread.start()
+		server, address = myServer.accept()
+		connInfo.update({
+			'server': server,
+			'active': False,
+			'packetSize': HEADERSIZE + CHECKSUMSIZE,
+			'synSeq': randint(0, 9999990),
+			'ackSeq': 0,
+			'msgInCount': 0
+		})
+		handshake()
+		if not connInfo.get('active'):
+			print('CONNECTION ERROR')
+		else:
+			print('CONNECTED SUCCESSFULLY')
+		sendThread = Thread(target=sendMessage)
+		receiveThread = Thread(target=receiveMessage)
+		inputThread = Thread(target=userInput)
+		dataProcessingThread = Thread(target=processData)
+		sendThread.start()
+		receiveThread.start()
+		inputThread.start()
+		dataProcessingThread.start()
 
-# Manages incoming connections
-def client_handler(client: socket, address: tuple):
-	connInfo = {'client': client, 'active': False, 'synSeq': randint(0, 9999990), 'ackSeq': 0}
-	handshake(connInfo)
-	if not connInfo.get('active'):
-		print(f'[{address[0]}: CONNECTION FAILED]')
+def sendPacket(msg: str = '', flags: str = DATA, syn: int = -1, ack: int = -1) -> bytes:
+	server = connInfo.get('server')
+	packet = f'{flags:<0{FLAGSIZE}}{PACKETSIZE+CHECKSUMSIZE:0{BUFFERSIZE}}'
+
+	if syn != -1:
+		packet += f'{syn:0{SYNSIZE}}'
+	else:
+		packet += f'{connInfo.get("synSeq"):0{SYNSIZE}}'
+	if ack != -1:
+		packet += f'{ack:0{ACKSIZE}}'
+	else:
+		packet += f'{connInfo.get("ackSeq"):0{ACKSIZE}}'
+	if msg != '':
+		packet += f'{msg:<{MSGSIZE}}'
+
+	packet = createChecksum(packet)
+	server.send(packet.encode('utf-8'))
+
+def handshake():
+	server: socket.socket = connInfo.get('server')
+	synPacket = verifyChecksum(server.recv(connInfo.get('packetSize')).decode('utf-8'))
+	if synPacket == None or synPacket[0:FLAGSIZE] != SYN:
 		return
-	print(f'[{address[0]}: CONNECTED SUCCESSFULLY]')
-
-	sendThread = Thread(target=send_msg, args=(connInfo,), daemon=True)
-	receiveThread = Thread(target=recv_msg, args=(connInfo,), daemon=True)
-	inputThread = Thread(target=user_input, args=(connInfo,), daemon=True)
-	receiveThread.start()
-	sendThread.start()
-	inputThread.start()
-
-	receiveThread.join()
-	sendThread.join()
-	client.shutdown(2)
-	client.close()
-	print ('[CONNECTION CLOSED]')
-
-# Manages initial handshake with clients
-def handshake(connInfo: dict):
-	client = connInfo.get('client')
-	synPacket = client.recv(PACKETSIZE).decode('utf-8')
-	if synPacket[0:3] != '100':
-		return
-	ackSeq = int(synPacket[3:10])
+	connInfo.update({'packetSize': int(synPacket[3:5])})
+	ackSeq = int(synPacket[5:12])
 	connInfo.update({'ackSeq': ackSeq + 1})
-	client.send(create_packet(connInfo, '', '110'))
+	sendPacket(flags=SYNACK)
 	connInfo.update({'ackSeq': ackSeq})
-	ackPacket = client.recv(PACKETSIZE).decode('utf-8')
-	if int(ackPacket[10:17]) != (connInfo.get('synSeq')+1) or ackPacket[0:3] != '010':
+	ackPacket = verifyChecksum(server.recv(connInfo.get('packetSize')).decode('utf-8'))
+	if synPacket == None or \
+		int(ackPacket[12:19]) != (connInfo.get('synSeq')+1) or \
+		ackPacket[0:3] != '010':
 		return
 	connInfo.update({'active': True})
 
-# Manages data being received from client
-def recv_msg(connInfo: dict):
-	client: socket = connInfo.get('client')
-	done = False
-	while not done:
-		packet = client.recv(PACKETSIZE).decode('utf-8')
-		if packet[0:3] == '000' and packet[17:23] == '#!#!#!':
-			msg = []
-			msgArrived = True
-			while True:
-				client.settimeout(5)
-				try:
-					packet = client.recv(PACKETSIZE).decode('utf-8')
-					if packet[0:3] == '000' and packet[17:23] == '!#!#!#':
-						msg[len(msg)-1] = msg[len(msg)-1].rstrip()
-						break
-					msg.append(packet[HEADERSIZE:PACKETSIZE])
-				except:
-					msgArrived = False
-					msg.clear()
-					break
-			client.settimeout(None)
-			if msgArrived:
-				output = ''
-				output = output.join(msg)
-				receiveQueue.put(output)
-				print('\033[96m[CLIENT] ' + output + '\033[0m')
-				newAckSeq = len(output) + connInfo.get('ackSeq')
-				if newAckSeq > 9999990:
-					newAckSeq -= 9999990
-				connInfo.update({'ackSeq': newAckSeq})
-				client.send(create_packet(connInfo, '', '010'))
+def sendMessage():
+	timesSent = 0
+	while True:
+		if not rawMsgOut.empty() and len(msgOut) == 0:
+			syn = connInfo.get('synSeq')
+			msg = rawMsgOut.get()
+			msg = msg.replace(' ', '/$%/')
+			msgLen = len(msg)
 
-		elif packet[0:3] == '010':
-			msgData = sentBuffer.get()
-			newSynSeq = connInfo.get('synSeq') + msgData[1]
-			if newSynSeq > 9999990:
-				newSynSeq -= 9999990
-			if int(packet[10:17]) == newSynSeq:
-				connInfo.update({'synSeq': newSynSeq})
-			else:
-				sendQueue.put(msgData)
+			if syn + msgLen >= 9999990:
+				syn = syn - 9999990
+				connInfo.update({'synSeq': syn})
 
-		elif packet[0:3] == '001':
-			done = True
-			connInfo.update({'active': False})
-
-# Manages data being sent to client
-def send_msg(connInfo: dict):
-	client = connInfo.get('client')
-	done = False
-	while not done:
-		if sentBuffer.empty() and not sendQueue.empty():
-			msg = sendQueue.get()
-			dataSent = len(msg)
-			msgList = []
-			loopRange = ceil(dataSent/MSGSIZE)-1
-
+			loopRange = ceil(len(msg)/MSGSIZE)-1
 			for x in range(loopRange):
-				msgList.append(msg[(MSGSIZE*x):MSGSIZE*(x+1)])
-			msgList.append(msg[((loopRange)*MSGSIZE):])
+				msgOut.append([msg[(MSGSIZE*x):MSGSIZE*(x+1)], False])
+			msgOut.append([msg[((loopRange)*MSGSIZE):], False])
+			msgOut.append(['!#!#!#', False])
 
-			client.send(create_packet(connInfo, '#!#!#!'))
-			for string in msgList:
-				packet = create_packet(connInfo, string)
-				client.send(packet)
-			client.send(create_packet(connInfo, '!#!#!#'))
-			sentBuffer.put([msgList, dataSent, time.time(), 0])
+		if len(msgOut) != 0:
+			syn = connInfo.get('synSeq')
+			for i, msg in enumerate(msgOut):
+				if not msgOut[i][1]:
+					sendPacket(msg[0], syn=syn)
+					syn += len(msg[0])
+					msgOut[i] = [msg[0], False, syn]
 
-		elif not sentBuffer.empty():
-			msgData = sentBuffer.get()
-			if msgData[3] <= 3 and time.time() - msgData[2] > 10:
-				#print('Data not acknowledged, sending again...')
-				client.send(create_packet(connInfo, '#!#!#!'))
-				for string in msgData[0]:
-					packet = create_packet(connInfo, string)
-					client.send(packet)
-				client.send(create_packet(connInfo, '!#!#!#'))
-				msgData[2] = time.time()
-				msgData[3] += 1
-				sentBuffer.put(msgData)
-			elif msgData[3] > 3:
-				connInfo.update({'active': False})
-				done = True
-				print ('[CONNECTION TIMED OUT]')
-			else:
-				sentBuffer.put(msgData)
+			for i, msg in enumerate(msgOut):
+				if msgOut[i][1] == True:
+					continue
+				ack = None
+				timesChecked = 0
+				while timesChecked < 5:
+					ack = ackIn.get(msg[2])
+					if ack == None:
+						timesChecked += 1
+						time.sleep(1)
+					else:
+						ackIn.pop(msg[2])
+						msgOut[i][1] = True
+						timesSent = 0
+						timesChecked = 0
+						connInfo.update({'synSeq': msg[2]})
+						break
+				if timesChecked >= 5:
+					timesSent += 1
+					if timesSent < 3:
+						print('[PACKET LOSS! SENDING DATA AGAIN...]')
+					else:
+						print('[CONNECTION LOST]')
+					break
+				if msgOut[len(msgOut)-1][1]:
+					msgOut.clear()
 
-		elif not connInfo.get('active') and sendQueue.empty() and sentBuffer.count == 0:
-			done = True
-			client.send(create_packet(connInfo, '', '001'))
+		if timesSent >= 3:
+			break
 		time.sleep(.1)
 
-# Takes input to be sent to client
-def user_input(connInfo: dict):
+def receiveMessage():
+	server: socket.socket = connInfo.get('server')
+	while True:
+		packet = verifyChecksum(server.recv(connInfo.get('packetSize')).decode('utf-8'))
+		if packet == None:
+			continue
+		syn = int(packet[5:12])
+		ack = int(packet[12:19])
+		if packet[0:3] == '010':
+			ack = int(packet[12:19])
+			ackIn.update({ack: packet})
+		else:
+			msgIn.update({syn: packet})
+			msgInCount = connInfo.get('msgInCount') + 1
+			connInfo.update({'msgInCount': msgInCount})
+
+
+def processData():
+	messageBuffer = ''
+	timesChecked = 0
+	while True:
+		if connInfo.get('msgInCount') > 0 and timesChecked < 10:
+			ack = connInfo.get('ackSeq')
+			packet = None
+			packet = msgIn.get(ack)
+			if packet == None:
+				timesChecked += 1
+				time.sleep(.01)
+				continue
+			timesChecked = 0
+			msg = packet[HEADERSIZE:PACKETSIZE].rstrip()
+
+			if msg == '!#!#!#':
+				messageBuffer = messageBuffer.replace('/$%/', ' ')
+				rawMsgIn.put(messageBuffer)
+				print(messageBuffer)
+				messageBuffer = ''
+			else:
+				messageBuffer += msg
+			connInfo.update({'ackSeq': (ack + len(msg))})
+			connInfo.update({'msgInCount': connInfo.get('msgInCount') - 1})
+			sendPacket(flags=ACK)
+			msgIn.pop(ack)
+		elif timesChecked >= 10:
+			print('[PACKET LOSS: DATA INCOMPLETE]')
+			msgIn.clear()
+			timesChecked = 0
+
+		time.sleep(.01)
+
+def userInput() -> None:
 	while True:
 		msg = input()
-		if not connInfo.get('active'):
-			break
-		if (msg == 'END'):
-			print('[CONNECTION IS NO LONGER ACTIVE]')
-			connInfo.update({'active': False})
-			break
-		msg = msg.rstrip()
-		sendQueue.put(msg)
+		rawMsgOut.put(msg)
 
-# Adds header and serializes packets
-def create_packet(connInfo: dict, msg: str, flags: str = '000') -> bytes:
-	formattedMsg = f'{flags:<03}{connInfo.get("synSeq"):07}{connInfo.get("ackSeq"):07}{msg:<15}'
-	return formattedMsg.encode('utf-8')
+def verifyChecksum(packet: str):
+	givenChecksum = int(packet[0:CHECKSUMSIZE])
+	packet = packet[6:]
+	charNum = ''
+	for char in packet:
+		charNum += f'{ord(char):03}'
+
+	charNum = f'{charNum:0>108}'
+	checksum = 0
+	for x in range(18):
+		checksum += int(charNum[x*6:(x+1)*6])
+
+	while checksum >= 1000000:
+		remainder = floor(checksum / 1000000)
+		checksum = checksum -(remainder * 1000000)
+		checksum += remainder
+
+	if givenChecksum == checksum:
+		return packet
+	else:
+		return None
+
+def createChecksum(packet: str):
+	charNum = ''
+	for char in packet:
+		charNum += f'{ord(char):03}'
+
+	charNum = f'{charNum:0>108}'
+	checksum = 0
+	for x in range(18):
+		checksum += int(charNum[x*6:(x+1)*6])
+
+	while checksum >= 1000000:
+		remainder = floor(checksum / 1000000)
+		checksum = checksum -(remainder * 1000000)
+		checksum += remainder
+	checksum = f'{checksum:0>6}'
+
+	return f'{checksum}{packet}'
 
 if __name__ == '__main__':
-	main()
+	startServer()
