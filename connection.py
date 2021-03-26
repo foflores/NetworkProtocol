@@ -84,6 +84,8 @@ class Client():
 		self.outgoing_data = []
 		self.ack_received = set()
 		self.data_received = {}
+		self.msg_buffer = ""
+		self.output_queue = Queue()
 		if not self._handshake():
 			print("[ATTEMPTED CONNECTION FAILED]")
 		data_processing_thread = Thread(target=self._data_processing)
@@ -102,6 +104,22 @@ class Client():
 						flags=ACK,
 						ack=data.get("syn_seq") + len(data.get("msg")),
 					)
+					# recreate message from packet
+					self.data_received.update({data.get("syn_seq"): data})
+					while True:
+						if self.conn_info.get("ack_seq") in self.data_received:
+							data = self.data_received.get(self.conn_info.get("ack_seq"))
+							msg = data.get("msg")
+							if msg != "!#!#!#":
+								self.msg_buffer += msg
+							else:
+								complete_msg = self.msg_buffer.replace("/$%/", " ")
+								self.output_queue.put(complete_msg)
+								print(complete_msg)
+								self.msg_buffer = ""
+							self.conn_info.update({"ack_seq": data.get("syn_seq") + len(msg)})
+						else:
+							break
 				elif data.get("flags") == ACK:
 					self.ack_received.add(data.get("ack_seq"))
 
@@ -160,6 +178,8 @@ class Client():
 							print(["[CONNECTION TIMED OUT]"])
 							break
 				self.outgoing_data = [x for x in self.outgoing_data if not x[0] or not x[1]]
+
+
 			time.sleep(.01)
 
 	def send(self, msg: str):
@@ -202,7 +222,6 @@ class Client():
 		raw_data = verify_checksum(raw_data)
 		if raw_data is None:
 			return None
-		print(raw_data)
 		data = {
 			"flags": raw_data[0:3],
 			"packet_size": int(raw_data[3:5]),
@@ -244,7 +263,7 @@ class Server():
 					}
 					if self._handshake(conn_info):
 						self.active_sockets.append(client)
-						self.active_clients.update({address: [conn_info, "", []]})
+						self.active_clients.update({address: [conn_info, "", {}, Queue()]})
 					else:
 						print("[ATTEMPTED CONNECTION FAILED]")
 				# receive incoming data
@@ -258,7 +277,6 @@ class Server():
 					if data is None:
 						continue
 					if data.get("flags") == DATA:
-						client_info[2].append(data)
 						try:
 							self._send_packet(
 								flags=ACK,
@@ -268,6 +286,23 @@ class Server():
 						except (BrokenPipeError, OSError):
 							self._clear_inactive_client(conn_info.get("address"))
 							break
+						client_info[2].update({data.get("syn_seq"): data})
+						# recreate message from packet
+						while True:
+							if conn_info.get("ack_seq") in client_info[2]:
+								data = client_info[2].get(conn_info.get("ack_seq"))
+								msg = data.get("msg")
+								if msg != "!#!#!#":
+									client_info[1] += msg
+								else:
+									complete_msg = client_info[1].replace("/$%/", " ")
+									client_info[3].put(complete_msg)
+									print(complete_msg)
+									client_info[1] = ""
+								conn_info.update({"ack_seq": data.get("syn_seq") + len(msg)})
+							else:
+								break
+
 					elif data.get("flags") == ACK:
 						ack_in = set()
 						if sock.getpeername() in self.ack_received:
@@ -359,7 +394,6 @@ class Server():
 		raw_data = verify_checksum(raw_data)
 		if raw_data is None:
 			return None
-		print (raw_data)
 		data = {
 			"flags": raw_data[0:3],
 			"packet_size": int(raw_data[3:5]),
@@ -431,3 +465,4 @@ class Server():
 		self.active_clients.pop(address)
 		self.raw_outgoing_data = [x for x in self.raw_outgoing_data if x[0] != address]
 		self.outgoing_data = [x for x in self.outgoing_data if x[0] != address]
+		print(f"[{address} HAS DISCONNECTED]")
