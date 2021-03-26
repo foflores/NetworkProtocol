@@ -10,3 +10,5 @@
 - buffer exchange to determine length of messages that will be sent by each side
 - Packet sequencing to determine the correct order packets should be in
 - checksum to determine the integrity of the message being sent
+- using select to allow for a multiple connections simultaneuosly
+- exception handling to prevent server errors when a client disconnects
