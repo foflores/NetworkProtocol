@@ -4,7 +4,6 @@ PACKET(42)
 """
 import time
 import socket
-import sys
 from select import select
 from threading import Thread
 from random import randint
@@ -51,7 +50,7 @@ def create_checksum(packet: str):
 
 def verify_checksum(packet: str):
 	if len(packet) < 25:
-		return
+		return None
 	given_checksum = int(packet[0:6])
 	packet = packet[6:]
 	char_num = ''
@@ -100,6 +99,7 @@ class Client():
 				if data is None:
 					continue
 				if data.get("flags") == DATA:
+					#print (data)
 					self._send_packet(
 						flags=ACK,
 						ack=data.get("syn_seq") + len(data.get("msg")),
@@ -115,7 +115,7 @@ class Client():
 							else:
 								complete_msg = self.msg_buffer.replace("/$%/", " ")
 								self.output_queue.put(complete_msg)
-								print(complete_msg)
+								# print(complete_msg)
 								self.msg_buffer = ""
 							self.conn_info.update({"ack_seq": data.get("syn_seq") + len(msg)})
 						else:
@@ -187,7 +187,10 @@ class Client():
 			return
 		self.raw_outgoing_data.append(msg)
 
-	def _handshake(self):
+	def recv(self):
+		return self.output_queue.get()
+
+	def _handshake(self) -> bool:
 		self._send_packet(flags=SYN)
 		syn_ack = self._receive_packet()
 		if syn_ack is None:
@@ -256,23 +259,25 @@ class Server():
 					client, address = self.server.accept()
 					conn_info = {
 						"client": client,
+						"address": address,
 						"packet_size": HEADER_SIZE + CHECKSUM_SIZE,
 						"syn_seq": randint(0, 9999990),
 						"ack_seq": 0,
-						"address": address
+						"packet_dict": {},
+						"partial_msg_buffer": "",
+						"msg_in_queue": Queue()
 					}
 					if self._handshake(conn_info):
 						self.active_sockets.append(client)
-						self.active_clients.update({address: [conn_info, "", {}, Queue()]})
+						self.active_clients.update({address: conn_info})
 					else:
 						print("[ATTEMPTED CONNECTION FAILED]")
 				# receive incoming data
 				else:
 					try:
-						client_info = self.active_clients.get(sock.getpeername())
+						conn_info = self.active_clients.get(sock.getpeername())
 					except OSError:
 						break
-					conn_info = client_info[0]
 					data = self._receive_packet(sock, conn_info)
 					if data is None:
 						continue
@@ -286,22 +291,29 @@ class Server():
 						except (BrokenPipeError, OSError):
 							self._clear_inactive_client(conn_info.get("address"))
 							break
-						client_info[2].update({data.get("syn_seq"): data})
+						packet_dict = conn_info.get("packet_dict")
+						partial_msg_buffer = conn_info.get("partial_msg_buffer")
+						msg_in_queue = conn_info.get("msg_in_queue")
+						packet_dict.update({data.get("syn_seq"): data})
 						# recreate message from packet
 						while True:
-							if conn_info.get("ack_seq") in client_info[2]:
-								data = client_info[2].get(conn_info.get("ack_seq"))
+							if conn_info.get("ack_seq") in packet_dict:
+								data = packet_dict.get(conn_info.get("ack_seq"))
 								msg = data.get("msg")
 								if msg != "!#!#!#":
-									client_info[1] += msg
+									partial_msg_buffer += msg
 								else:
-									complete_msg = client_info[1].replace("/$%/", " ")
-									client_info[3].put(complete_msg)
-									print(complete_msg)
-									client_info[1] = ""
+									complete_msg = partial_msg_buffer.replace("/$%/", " ")
+									msg_in_queue.put(complete_msg)
+									# print(complete_msg)
+									partial_msg_buffer = ""
 								conn_info.update({"ack_seq": data.get("syn_seq") + len(msg)})
 							else:
 								break
+						conn_info.update({"packet_dict": packet_dict})
+						conn_info.update({"partial_msg_buffer": partial_msg_buffer})
+						conn_info.update({"msg_in_queue": msg_in_queue})
+
 
 					elif data.get("flags") == ACK:
 						ack_in = set()
@@ -313,8 +325,7 @@ class Server():
 			# format outgoing data
 			if len(self.raw_outgoing_data) != 0:
 				for data in self.raw_outgoing_data:
-					client_info = self.active_clients.get(data[0])
-					conn_info = client_info[0]
+					conn_info = self.active_clients.get(data[0])
 					msg = data[1]
 					syn = conn_info.get("syn_seq")
 					msg = msg.replace(" ", "/$%/")
@@ -329,8 +340,7 @@ class Server():
 					self.outgoing_data.append([data[0], [False, False, syn, "!#!#!#"]])
 					syn += 6
 					conn_info.update({"syn_seq": syn})
-					client_info[0] = conn_info
-					self.active_clients.update({data[0]: client_info})
+					self.active_clients.update({data[0]: conn_info})
 				self.raw_outgoing_data.clear()
 
 			# send outgoing packets and check for ack packets
@@ -338,8 +348,7 @@ class Server():
 				address_timed_out = None
 				for i, packet_data in enumerate(self.outgoing_data):
 					address = packet_data[0]
-					client_info = self.active_clients.get(address)
-					conn_info = client_info[0]
+					conn_info = self.active_clients.get(address)
 					packet_data = packet_data[1]
 					if not packet_data[0]:
 						try:
@@ -377,6 +386,7 @@ class Server():
 						elif self.outgoing_data[i][1][5] < 3 and time.time() - 10 > packet_data[4]:
 							self.outgoing_data[i][1][0] = False
 							self.outgoing_data[i][1][4] = time.time()
+							print("NO ACK RECV, SENDING AGAIN")
 						else:
 							print([f"[CONNECTION TIMED OUT TO {address}]"])
 							address_timed_out = address
@@ -410,6 +420,13 @@ class Server():
 			self.raw_outgoing_data.append([address, msg])
 		else:
 			print("[CONNECTION IS NO LONGER ACTIVE]")
+
+	def recv_from(self, address: tuple):
+		conn_info = self.active_clients.get(address)
+		if conn_info is None:
+			return None
+		msg_in_queue = conn_info.get("msg_in_queue")
+		return msg_in_queue.get(False)
 
 	def get_clients(self):
 		return list(self.active_clients.keys())
@@ -459,8 +476,8 @@ class Server():
 		client.send(packet.encode('utf-8'))
 
 	def _clear_inactive_client(self, address):
-		client_info = self.active_clients.get(address)
-		client = client_info[0].get("client")
+		conn_info = self.active_clients.get(address)
+		client = conn_info.get("client")
 		self.active_sockets.remove(client)
 		self.active_clients.pop(address)
 		self.raw_outgoing_data = [x for x in self.raw_outgoing_data if x[0] != address]
