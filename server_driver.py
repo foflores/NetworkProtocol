@@ -5,7 +5,7 @@ import queue
 import connection
 
 def main():
-	server = connection.Server(8053)
+	server = connection.Server(8052)
 	incoming_message_thread = Thread(target=print_incoming_message, args=(server,))
 	incoming_message_thread.start()
 	while True:

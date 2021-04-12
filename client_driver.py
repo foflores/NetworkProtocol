@@ -3,7 +3,7 @@ import time
 from threading import Thread
 import connection
 
-SERVER = ("192.168.1.108", 8053)
+SERVER = ("192.168.1.108", 8052)
 
 def main():
 	client = connection.Client(SERVER)

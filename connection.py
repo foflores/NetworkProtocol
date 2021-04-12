@@ -70,6 +70,7 @@ def verify_checksum(packet: str):
 	if given_checksum == checksum:
 		return packet
 
+
 class Client():
 	def __init__(self, address: tuple):
 		self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
@@ -90,6 +91,16 @@ class Client():
 		data_processing_thread = Thread(target=self._data_processing)
 		data_processing_thread.start()
 
+	# public
+	def send(self, msg: str):
+		if msg == "":
+			return
+		self.raw_outgoing_data.append(msg)
+
+	def recv(self):
+		return self.output_queue.get()
+
+	# private
 	def _data_processing(self):
 		while True:
 			# receive incoming packets
@@ -99,7 +110,6 @@ class Client():
 				if data is None:
 					continue
 				if data.get("flags") == DATA:
-					#print (data)
 					self._send_packet(
 						flags=ACK,
 						ack=data.get("syn_seq") + len(data.get("msg")),
@@ -115,7 +125,6 @@ class Client():
 							else:
 								complete_msg = self.msg_buffer.replace("/$%/", " ")
 								self.output_queue.put(complete_msg)
-								# print(complete_msg)
 								self.msg_buffer = ""
 							self.conn_info.update({"ack_seq": data.get("syn_seq") + len(msg)})
 						else:
@@ -178,18 +187,9 @@ class Client():
 							print(["[CONNECTION TIMED OUT]"])
 							break
 				self.outgoing_data = [x for x in self.outgoing_data if not x[0] or not x[1]]
-
-
 			time.sleep(.01)
 
-	def send(self, msg: str):
-		if msg == "":
-			return
-		self.raw_outgoing_data.append(msg)
-
-	def recv(self):
-		return self.output_queue.get()
-
+	# helper
 	def _handshake(self) -> bool:
 		self._send_packet(flags=SYN)
 		syn_ack = self._receive_packet()
@@ -234,7 +234,6 @@ class Client():
 		}
 		return data
 
-
 class Server():
 	def __init__(self, port: int = 8050, queue_size: int = 5):
 		self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
@@ -245,10 +244,30 @@ class Server():
 		self.raw_outgoing_data = []
 		self.outgoing_data = []
 		self.ack_received = dict()
-		start_server_thread = Thread(target=self.start_server)
+		start_server_thread = Thread(target=self._start_server)
 		start_server_thread.start()
 
-	def start_server(self):
+	# public
+	def send_to(self, msg: str, address: tuple):
+		if msg == "":
+			return
+		if address in self.active_clients:
+			self.raw_outgoing_data.append([address, msg])
+		else:
+			print("[CONNECTION IS NO LONGER ACTIVE]")
+
+	def recv_from(self, address: tuple):
+		conn_info = self.active_clients.get(address)
+		if conn_info is None:
+			return None
+		msg_in_queue = conn_info.get("msg_in_queue")
+		return msg_in_queue.get(False)
+
+	def get_clients(self):
+		return list(self.active_clients.keys())
+
+	# private
+	def _start_server(self):
 		while True:
 			# handle ready I/O
 			socket_list = self.active_sockets
@@ -274,53 +293,9 @@ class Server():
 						print("[ATTEMPTED CONNECTION FAILED]")
 				# receive incoming data
 				else:
-					try:
-						conn_info = self.active_clients.get(sock.getpeername())
-					except OSError:
+					num = self._receive_incoming_data(sock)
+					if num == 0:
 						break
-					data = self._receive_packet(sock, conn_info)
-					if data is None:
-						continue
-					if data.get("flags") == DATA:
-						try:
-							self._send_packet(
-								flags=ACK,
-								ack=data.get("syn_seq") + len(data.get("msg")),
-								conn_info=conn_info
-							)
-						except (BrokenPipeError, OSError):
-							self._clear_inactive_client(conn_info.get("address"))
-							break
-						packet_dict = conn_info.get("packet_dict")
-						partial_msg_buffer = conn_info.get("partial_msg_buffer")
-						msg_in_queue = conn_info.get("msg_in_queue")
-						packet_dict.update({data.get("syn_seq"): data})
-						# recreate message from packet
-						while True:
-							if conn_info.get("ack_seq") in packet_dict:
-								data = packet_dict.get(conn_info.get("ack_seq"))
-								msg = data.get("msg")
-								if msg != "!#!#!#":
-									partial_msg_buffer += msg
-								else:
-									complete_msg = partial_msg_buffer.replace("/$%/", " ")
-									msg_in_queue.put(complete_msg)
-									# print(complete_msg)
-									partial_msg_buffer = ""
-								conn_info.update({"ack_seq": data.get("syn_seq") + len(msg)})
-							else:
-								break
-						conn_info.update({"packet_dict": packet_dict})
-						conn_info.update({"partial_msg_buffer": partial_msg_buffer})
-						conn_info.update({"msg_in_queue": msg_in_queue})
-
-
-					elif data.get("flags") == ACK:
-						ack_in = set()
-						if sock.getpeername() in self.ack_received:
-							ack_in = self.ack_received.get(sock.getpeername())
-						ack_in.add(data.get("ack_seq"))
-						self.ack_received.update({sock.getpeername(): ack_in})
 
 			# format outgoing data
 			if len(self.raw_outgoing_data) != 0:
@@ -393,43 +368,60 @@ class Server():
 							break
 
 				self.outgoing_data = [x for x in self.outgoing_data if not x[1][0] or not x[1][1]]
-
 				# remove any connections that timed out
 				if address_timed_out is not None:
 					self._clear_inactive_client(address_timed_out)
 			time.sleep(.01)
 
-	def _receive_packet(self, client: socket.socket, conn_info: dict):
-		raw_data = client.recv(conn_info.get("packet_size")).decode("utf-8")
-		raw_data = verify_checksum(raw_data)
-		if raw_data is None:
-			return None
-		data = {
-			"flags": raw_data[0:3],
-			"packet_size": int(raw_data[3:5]),
-			"syn_seq": int(raw_data[5:12]),
-			"ack_seq": int(raw_data[12:19]),
-			"msg": raw_data[HEADER_SIZE:].rstrip()
-		}
-		return data
+	# helper functions
+	def _receive_incoming_data(self, sock: socket.socket) -> int:
+		try:
+			conn_info = self.active_clients.get(sock.getpeername())
+		except OSError:
+			return 0
+		data = self._receive_packet(sock, conn_info)
+		if data is None:
+			return 1
+		if data.get("flags") == DATA:
+			try:
+				self._send_packet(
+					flags=ACK,
+					ack=data.get("syn_seq") + len(data.get("msg")),
+					conn_info=conn_info
+				)
+			except (BrokenPipeError, OSError):
+				self._clear_inactive_client(conn_info.get("address"))
+				return 0
+			packet_dict = conn_info.get("packet_dict")
+			partial_msg_buffer = conn_info.get("partial_msg_buffer")
+			msg_in_queue = conn_info.get("msg_in_queue")
+			packet_dict.update({data.get("syn_seq"): data})
+			# recreate message from packet
+			while True:
+				if conn_info.get("ack_seq") in packet_dict:
+					data = packet_dict.get(conn_info.get("ack_seq"))
+					msg = data.get("msg")
+					if msg != "!#!#!#":
+						partial_msg_buffer += msg
+					else:
+						complete_msg = partial_msg_buffer.replace("/$%/", " ")
+						msg_in_queue.put(complete_msg)
+						partial_msg_buffer = ""
+					conn_info.update({"ack_seq": data.get("syn_seq") + len(msg)})
+				else:
+					break
+			conn_info.update({"packet_dict": packet_dict})
+			conn_info.update({"partial_msg_buffer": partial_msg_buffer})
+			conn_info.update({"msg_in_queue": msg_in_queue})
 
-	def send_to(self, msg: str, address: tuple):
-		if msg == "":
-			return
-		if address in self.active_clients:
-			self.raw_outgoing_data.append([address, msg])
-		else:
-			print("[CONNECTION IS NO LONGER ACTIVE]")
+		elif data.get("flags") == ACK:
+			ack_in = set()
+			if sock.getpeername() in self.ack_received:
+				ack_in = self.ack_received.get(sock.getpeername())
+			ack_in.add(data.get("ack_seq"))
+			self.ack_received.update({sock.getpeername(): ack_in})
 
-	def recv_from(self, address: tuple):
-		conn_info = self.active_clients.get(address)
-		if conn_info is None:
-			return None
-		msg_in_queue = conn_info.get("msg_in_queue")
-		return msg_in_queue.get(False)
-
-	def get_clients(self):
-		return list(self.active_clients.keys())
+		return 1
 
 	def _handshake(self, conn_info) -> bool:
 		client: socket.socket = conn_info.get("client")
@@ -449,6 +441,20 @@ class Server():
 			ack_packet.get("flags") != ACK:
 			return False
 		return True
+
+	def _receive_packet(self, client: socket.socket, conn_info: dict):
+		raw_data = client.recv(conn_info.get("packet_size")).decode("utf-8")
+		raw_data = verify_checksum(raw_data)
+		if raw_data is None:
+			return None
+		data = {
+			"flags": raw_data[0:3],
+			"packet_size": int(raw_data[3:5]),
+			"syn_seq": int(raw_data[5:12]),
+			"ack_seq": int(raw_data[12:19]),
+			"msg": raw_data[HEADER_SIZE:].rstrip()
+		}
+		return data
 
 	def _send_packet(
 		self,
