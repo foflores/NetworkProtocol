@@ -1,11 +1,11 @@
-import socket
 import time
 from threading import Thread
 import queue
-import connection
+from network import Connection
 
 def main():
-	server = connection.Server(8052)
+	server = Connection()
+	server.listen(8052)
 	incoming_message_thread = Thread(target=print_incoming_message, args=(server,))
 	incoming_message_thread.start()
 	while True:
