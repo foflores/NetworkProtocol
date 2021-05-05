@@ -12,7 +12,7 @@ def main():
 		clients = server.get_clients()
 		for client in clients:
 			data = input()
-			server.send_to(data, client)
+			server.send_data(data, client)
 
 def print_incoming_message(server):
 	while True:

@@ -1,98 +1,134 @@
 """
-PACKET(42)
-|CHECKSUM(6) |FLAGS(3) |BUFSIZE(2) |SEQNUM(7) |ACKNUM(7) |MSG(17) |
+PACKET(43)
+|CHECKSUM(6) |FLAGS(4) |BUFSIZE(2) |SEQNUM(7) |ACKNUM(7) |MSG(17)
+
+get request:
+	- requests specific file size from all servers
+	- servers return file size
+	- make they have file and file is the same size
+	- request 1 chunk from each connected server
+		- chunks will be sized in 1024 bytes?
+		- they will be numbered by chunk size
+			- 1: bytes 0 - 1023
+			- 2: bytes 1024-2047
+			- etc
+	- wait up to 30 seconds for chunks
+		- if chunk does not arrive, update conn_info
+		- request chunk from next server
+		- wait 30 secs
+		- loop through each server until it arrives
+		- or print file incomplete if not
 """
 import time
 import socket
+import os
 from select import select
 from threading import Thread
 from random import randint
 from queue import Queue
 from math import ceil
-from math import floor
 
 CHECKSUM_SIZE = 6
-FLAG_SIZE = 3
+FLAG_SIZE = 4
 BUFFER_SIZE = 2
-SYN_SIZE = 7
+SEQ_SIZE = 7
 ACK_SIZE = 7
 MSG_SIZE = 17
+CHUNK_SIZE = 100
 
-HEADER_SIZE = FLAG_SIZE + BUFFER_SIZE + SYN_SIZE + ACK_SIZE
+HEADER_SIZE = FLAG_SIZE + BUFFER_SIZE + SEQ_SIZE + ACK_SIZE
 PACKET_SIZE = HEADER_SIZE + MSG_SIZE
+TRANSMISSION_SIZE = PACKET_SIZE + CHECKSUM_SIZE
 
-SYN = "000"
-SYN_ACK = "001"
-ACK = "010"
-REQ = "011"
-DATA = "100"
-FIN = "111"
+SYN = "0000"
+SYN_ACK = "0001"
+ACK = "0010"
+DATA_CHECK = "0011"
+DATA_CHECK_R = "0100"
+DATA_REQUEST = "0101"
+DATA_REQUEST_R = "0110"
+DATA = "0111"
+FIN = "1000"
 
 def create_checksum(packet: str) -> str:
-	char_num = ''
+	if len(packet) < HEADER_SIZE:
+		return None
+	c_sum = 0
 	for char in packet:
-		char_num += f'{ord(char):03}'
+		c_sum += ord(char)
 
-	char_num = f'{char_num:0>108}'
-	checksum = 0
-	for i in range(18):
-		checksum += int(char_num[i * 6:(i + 1) * 6])
+	while c_sum >= 1000000:
+		remainder = c_sum / 1000000
+		c_sum += remainder
+	c_sum = f'{c_sum:0>{CHECKSUM_SIZE}}'
 
-	while checksum >= 1000000:
-		remainder = floor(checksum / 1000000)
-		checksum = checksum - (remainder * 1000000)
-		checksum += remainder
-	checksum = f'{checksum:0>6}'
-
-	return f'{checksum}{packet}'
+	return f'{c_sum}{packet}'
 
 
 def verify_checksum(packet: str) -> str:
-	if len(packet) < 25:
+	if len(packet) < HEADER_SIZE + CHECKSUM_SIZE:
 		return None
-	given_checksum = int(packet[0:6])
-	packet = packet[6:]
-	char_num = ''
+	given_c_sum = int(packet[0:CHECKSUM_SIZE])
+	packet = packet[CHECKSUM_SIZE:]
+	c_sum = 0
 	for char in packet:
-		char_num += f'{ord(char):03}'
+		c_sum += ord(char)
 
-	char_num = f'{char_num:0>108}'
-	checksum = 0
-	for i in range(18):
-		checksum += int(char_num[i * 6:(i + 1) * 6])
-
-	while checksum >= 1000000:
-		remainder = floor(checksum / 1000000)
-		checksum = checksum - (remainder * 1000000)
-		checksum += remainder
-
-	if given_checksum == checksum:
+	while c_sum >= 1000000:
+		remainder = c_sum / 1000000
+		c_sum += remainder
+	if given_c_sum == c_sum:
 		return packet
-
+	return None
 
 class Connection():
 	def __init__(self):
-		self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+		self.server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
+		self.listening = False
 		self.active_conns = {}
-		self.active_sockets = [self.server]
 		self.raw_outgoing_data = []
 		self.outgoing_data = []
 		self.ack_received = dict()
+		self.clear_connection = Queue()
+		self.data_requests = {}
+		self.data_requests_r = []
 		start_server_thread = Thread(target=self._start_server)
 		start_server_thread.start()
 
 	# public
-	def send_to(self, msg: str, address: tuple):
+	def send_data(self, msg: str, address: tuple):
 		if msg == "":
 			return
 		if address in self.active_conns:
-			self.raw_outgoing_data.append([address, msg])
+			self.raw_outgoing_data.append([address, msg, DATA])
 		else:
-			print("[CONNECTION IS NO LONGER ACTIVE]")
+			print(f"{address} IS NOT CONNECTED")
+
+	def send_req(self, f_name: str):
+		if f_name == "":
+			return
+		for address in self.active_conns:
+			self.raw_outgoing_data.append([address, f_name, DATA_CHECK])
+			self.data_requests.update({f_name: [0, time.time(), [], 0, dict(), None]})
+
+	def recv_req(self, f_name: str):
+		if f_name in self.data_requests:
+			data = self.data_requests.get(f_name)
+			if data[0] == -1:
+				print("[ERROR RECEIVING DATA]")
+				return None
+			elif data[0] == 5:
+				return data[0]
+			else:
+				print("[REQUEST IN PROGRESS]")
+				return None
+		print ("[REQUEST NOT FOUND]")
+		return None
 
 	def recv_from(self, address: tuple):
 		conn_info = self.active_conns.get(address)
 		if conn_info is None:
+			print(f"{address} IS NOT CONNECTED")
 			return None
 		msg_in_queue = conn_info.get("msg_in_queue")
 		return msg_in_queue.get(False)
@@ -100,124 +136,199 @@ class Connection():
 	def get_clients(self):
 		return list(self.active_conns.keys())
 
-	def listen(self, port: int = 8050, queue_size: int = 5):
+	def listen(self, port: int = 8050):
 		self.server.bind((socket.gethostbyname(socket.gethostname()), port))
-		self.server.listen(queue_size)
+		self.listening = True
 
 	def connect(self, address: tuple):
-		new_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
-		new_connection.connect(address)
-		conn_info = {
-			"client": new_connection,
-			"address": address,
-			"packet_size": HEADER_SIZE + CHECKSUM_SIZE,
-			"syn_seq": randint(0, 9999990),
-			"ack_seq": 0,
-			"packet_dict": {},
-			"partial_msg_buffer": "",
-			"msg_in_queue": Queue(),
-			"dropped_packets": [0, 0.0]
-		}
-		if self._handshake_init(conn_info):
-			self.active_sockets.append(new_connection)
-			self.active_conns.update({address: conn_info})
-		else:
+		if not self._handshake_init0(address):
 			print("[ATTEMPTED CONNECTION FAILED]")
-
+			return
+		conn_timer = time.time()
+		while time.time() - conn_timer < 5:
+			conn_info = self.active_conns.get(address)
+			if conn_info.get("conn_step") == 1:
+				print("[CONNECTION SUCCESSFUL]")
+				return
+			time.sleep(.5)
+		print("[ATTEMPTED CONNECTION FAILED]")
+		return
 
 	# private
 	def _start_server(self):
 		while True:
-			# handle ready I/O
-			socket_list = self.active_sockets
-			ready_sockets, _, _ = select(socket_list, [], [], 0)
-			for sock in ready_sockets:
-				# accept incoming connections
-				if sock == self.server:
-					client, address = self.server.accept()
-					conn_info = {
-						"client": client,
-						"address": address,
-						"packet_size": HEADER_SIZE + CHECKSUM_SIZE,
-						"syn_seq": randint(0, 9999990),
-						"ack_seq": 0,
-						"packet_dict": {},
-						"partial_msg_buffer": "",
-						"msg_in_queue": Queue(),
-						"dropped_packets": [0, 0.0]
-					}
-					if self._handshake(conn_info):
-						self.active_sockets.append(client)
-						self.active_conns.update({address: conn_info})
-					else:
-						print("[ATTEMPTED CONNECTION FAILED]")
-				else:
-					num = self._receive_incoming_data(sock)
-					if num == 0:
-						break
+			# check if packet incoming
+			ready_sockets, _, _ = select([self.server], [], [], 0)
+			# process incoming packet
+			if len(ready_sockets) != 0:
+				data = self._receive_packet()
+				if data is None:
+					continue
+				if data.get("address") in self.active_conns or self.listening:
+					self._sort_incoming_packets(data)
 
+			# process data requests
+			if len(self.data_requests) != 0 or len(self.data_requests_r) != 0:
+				self._process_data_requests()
+
+			# format outgoing data
 			if len(self.raw_outgoing_data) != 0:
 				self._format_outgoing_data()
 
 			if len(self.outgoing_data) != 0:
-				address_timed_out = self._send_outgoing_data()
+				for i, packet_data in enumerate(self.outgoing_data):
+					# send outgoing data
+					if not packet_data[1][0]:
+						self._send_outgoing_data(packet_data, i)
+					# check for ack packets
+					elif packet_data[1][0] and not packet_data[1][1]:
+						self._check_for_ack_packets(packet_data, i)
 				self.outgoing_data = [x for x in self.outgoing_data if not x[1][0] or not x[1][1]]
 
-				# remove any connections that timed out
-				if address_timed_out is not None:
-					self._clear_inactive_client(address_timed_out)
+			# terminate problematic connections
+			while not self.clear_connection.empty():
+				self._clear_inactive_client(self.clear_connection.get())
 
 			time.sleep(.01)
 
 	# helper functions
-	def _receive_incoming_data(self, sock: socket.socket) -> int:
-		try:
-			conn_info = self.active_conns.get(sock.getpeername())
-		except OSError:
-			return 0
-		data = self._receive_packet(sock, conn_info)
-		if data is None:
-			return 1
-		if data.get("flags") == DATA:
-			try:
-				self._send_packet(
-					flags=ACK,
-					ack=data.get("syn_seq") + len(data.get("msg")),
-					conn_info=conn_info
-				)
-			except (BrokenPipeError, OSError):
-				self._clear_inactive_client(conn_info.get("address"))
-				return 0
-			packet_dict = conn_info.get("packet_dict")
-			partial_msg_buffer = conn_info.get("partial_msg_buffer")
-			msg_in_queue = conn_info.get("msg_in_queue")
-			packet_dict.update({data.get("syn_seq"): data})
-			# recreate message from packet
-			while True:
-				if conn_info.get("ack_seq") in packet_dict:
-					data = packet_dict.get(conn_info.get("ack_seq"))
-					msg = data.get("msg")
-					if msg != "!#!#!#":
-						partial_msg_buffer += msg
-					else:
-						complete_msg = partial_msg_buffer.replace("/$%/", " ")
-						msg_in_queue.put(complete_msg)
-						partial_msg_buffer = ""
-					conn_info.update({"ack_seq": data.get("syn_seq") + len(msg)})
-				else:
-					break
-			conn_info.update({"packet_dict": packet_dict})
-			conn_info.update({"partial_msg_buffer": partial_msg_buffer})
-			conn_info.update({"msg_in_queue": msg_in_queue})
+	def _sort_incoming_packets(self, data):
+		if data.get("address") in self.active_conns:
+			conn_info = self.active_conns.get(data.get("address"))
+			flags = data.get("flags")
+			if conn_info.get("conn_step") == 0:
+				if flags == SYN_ACK and not self._handshake_init1(data):
+					print("[ATTEMPTED CONNECTION FAILED]")
 
-		elif data.get("flags") == ACK:
-			ack_in = set()
-			if sock.getpeername() in self.ack_received:
-				ack_in = self.ack_received.get(sock.getpeername())
-			ack_in.add(data.get("ack_seq"))
-			self.ack_received.update({sock.getpeername(): ack_in})
+				elif flags == ACK and not self._handshake1(data):
+					print("[ATTEMPTED CONNECTION FAILED]")
+
+			elif conn_info.get("conn_step") == 1:
+				if flags in (DATA, DATA_CHECK, DATA_CHECK_R, DATA_REQUEST, DATA_REQUEST_R):
+					self._process_data_packet(data)
+
+				elif flags == ACK:
+					self._process_ack_packet(data)
+
+		elif data.get("flags") == SYN and self.listening and not self._handshake0(data):
+			print("[ATTEMPTED CONNECTION FAILED]")
+
+	def _process_data_packet(self, data) -> int:
+		conn_info = self.active_conns.get(data.get("address"))
+		try:
+			self._send_packet(
+				flags=ACK,
+				ack=data.get("syn_seq") + len(data.get("msg")),
+				conn_info=conn_info
+			)
+		except (BrokenPipeError, OSError):
+			self.clear_connection.put(conn_info.get("address"))
+			return 0
+		packet_dict = conn_info.get("packet_dict")
+		partial_msg_buffer = conn_info.get("partial_msg_buffer")
+		msg_in_queue = conn_info.get("msg_in_queue")
+		packet_dict.update({data.get("syn_seq"): data})
+		# recreate message from packet
+		while True:
+			if conn_info.get("ack_seq") in packet_dict:
+				data = packet_dict.get(conn_info.get("ack_seq"))
+				msg = data.get("msg")
+				# print(f"incoming: {len(msg)}")
+				if msg != "!#!#!#":
+					partial_msg_buffer += msg
+					# print(f"partials: {partial_msg_buffer}")
+				else:
+					complete_msg = partial_msg_buffer.replace("/$%/", " ")
+					# print (f"complete: {complete_msg}")
+					if data.get("flags") == DATA:
+						msg_in_queue.put(complete_msg)
+						# print(f"data complete msg: {complete_msg}")
+					else:
+						self.data_requests_r.append([data.get("address"), data.get("flags"), complete_msg])
+						# print(f"complete msg: {complete_msg}")
+					partial_msg_buffer = ""
+				conn_info.update({"ack_seq": data.get("syn_seq") + len(msg)})
+			else:
+				break
+		conn_info.update({"packet_dict": packet_dict})
+		conn_info.update({"partial_msg_buffer": partial_msg_buffer})
+		conn_info.update({"msg_in_queue": msg_in_queue})
 
 		return 1
+
+	def _process_ack_packet(self, data) -> int:
+		ack_in = set()
+		if data.get("address") in self.ack_received:
+			ack_in = self.ack_received.get(data.get("address"))
+		ack_in.add(data.get("ack_seq"))
+		self.ack_received.update({data.get("address"): ack_in})
+
+		return 1
+
+	def _process_data_requests(self):
+		for request in self.data_requests_r:
+			if request[1] == DATA_CHECK:
+				file_path = request[2]
+				if os.path.isfile(file_path):
+					file_size = str(os.path.getsize(file_path))
+					msg = file_path + " " + file_size
+					self.raw_outgoing_data.append([request[0], msg, DATA_CHECK_R])
+				else:
+					msg = file_path + " 0"
+					self.raw_outgoing_data.append([request[0], msg, DATA_CHECK_R])
+			elif request[1] == DATA_CHECK_R:
+				msg = request[2].split()
+				req = self.data_requests.get(msg[0])
+				if int(msg[1]) != 0 and time.time() - req[1] < 10:
+					req[2].append(request[0])
+					req[3] = int(msg[1])
+
+			elif request[1] == DATA_REQUEST:
+				msg = request[2].split()
+				file = open(msg[0], "rt")
+				data = file.read(int(msg[1]))
+				data = file.read(int(msg[2]))
+				if not file.readline():
+					data = data.rstrip()
+				data = msg[0] + " " + msg[1] + " " + msg[2] + " " + data
+				# print(f"sending: {data}\nlength: {len(data)}")
+				self.raw_outgoing_data.append([request[0], data, DATA_REQUEST_R])
+			elif request[1] == DATA_REQUEST_R:
+				msg = request[2].split(" ", 3)
+				# print(f"msg after split: {msg}")
+				req = self.data_requests.get(msg[0])
+				if time.time() - float(req[1]) < 20:
+					req[4].update({int(msg[1]): msg[3]})
+				self.data_requests.update({msg[0]: req})
+				chunks = ceil(req[3]/CHUNK_SIZE)
+				if len(req[4]) == chunks:
+					counter = 0
+					msg = ""
+					while counter < chunks:
+						msg += req[4].get(counter*CHUNK_SIZE)
+						counter += 1
+					file = open("./README2.md", "w")
+					file.write(msg)
+
+		self.data_requests_r.clear()
+
+		for i in self.data_requests:
+			req = self.data_requests.get(i)
+			if time.time() - req[1] > 10 and len(req[2]) != 0 and req[0] == 0:
+				chunks = ceil(req[3]/CHUNK_SIZE)
+				addresses = len(req[2])
+				chunk_counter = 0
+				address_counter = 0
+				while chunk_counter < chunks:
+					msg = i + " " + str(CHUNK_SIZE*chunk_counter) + " " + str(CHUNK_SIZE)
+					self.raw_outgoing_data.append([req[2][address_counter], msg, DATA_REQUEST])
+					chunk_counter += 1
+					address_counter += 1
+					if address_counter == addresses:
+						address_counter = 0
+				req[0] = 1
+				req[1] = time.time()
+			self.data_requests.update({i: req})
 
 	def _format_outgoing_data(self):
 		for data in self.raw_outgoing_data:
@@ -228,121 +339,153 @@ class Connection():
 			loop_range = ceil(len(msg) / MSG_SIZE) - 1
 			for i in range(loop_range):
 				msg_slice = msg[(MSG_SIZE * i):MSG_SIZE * (i + 1)]
-				self.outgoing_data.append([data[0], [False, False, syn, msg_slice]])
+				self.outgoing_data.append([data[0], [False, False, syn, msg_slice, data[2]]])
 				syn += len(msg_slice)
 				if syn > 9999999:
 					syn = syn - 9999999
 			msg_slice = msg[((loop_range) * MSG_SIZE):]
-			self.outgoing_data.append([data[0], [False, False, syn, msg_slice]])
+			self.outgoing_data.append([data[0], [False, False, syn, msg_slice, data[2]]])
 			syn += len(msg_slice)
 			if syn > 9999999:
 				syn = syn - 9999999
-			self.outgoing_data.append([data[0], [False, False, syn, "!#!#!#"]])
+			self.outgoing_data.append([data[0], [False, False, syn, "!#!#!#", data[2]]])
 			syn += 6
 			if syn > 9999999:
 				syn = syn - 9999999
 			conn_info.update({"syn_seq": syn})
 			self.active_conns.update({data[0]: conn_info})
 		self.raw_outgoing_data.clear()
+		# print(self.outgoing_data)
 
-	def _send_outgoing_data(self):
-		address_timed_out = None
-		for i, packet_data in enumerate(self.outgoing_data):
-			address = packet_data[0]
-			conn_info = self.active_conns.get(address)
-			packet_data = packet_data[1]
-			# send outgoing packets
-			if not packet_data[0]:
-				try:
-					self._send_packet(conn_info, packet_data[3], syn=packet_data[2])
-				except (BrokenPipeError, OSError):
-					self._clear_inactive_client(address)
-					break
-				if len(packet_data) < 6:
-					packet_data = [
-						True,
-						False,
-						packet_data[2],
-						packet_data[3],
-						time.time(),
-						1
-					]
-				else:
-					packet_data = [
-						True,
-						False,
-						packet_data[2],
-						packet_data[3],
-						time.time(),
-						packet_data[5] + 1
-					]
-				self.outgoing_data[i] = [address, packet_data]
-			# check for ACK packets
-			elif packet_data[0] and not packet_data[1]:
-				ack_expected = packet_data[2] + len(packet_data[3])
-				if ack_expected > 9999999:
-					ack_expected = ack_expected - 9999999
-				ack_in = self.ack_received.get(address)
-				if time.time() - 10 <= packet_data[4]:
-					if ack_in is not None and ack_expected in ack_in:
-						self.outgoing_data[i][1][1] = True
-						ack_in.remove(ack_expected)
-						self.ack_received.update({address: ack_in})
-				elif self.outgoing_data[i][1][5] < 3 and time.time() - 10 > packet_data[4]:
-					self.outgoing_data[i][1][0] = False
-					self.outgoing_data[i][1][4] = time.time()
-				else:
-					print([f"[CONNECTION TIMED OUT TO {address}]"])
-					address_timed_out = address
-					return address_timed_out
-		return address_timed_out
+	def _send_outgoing_data(self, packet_data, index):
 
-	def _handshake(self, conn_info) -> bool:
-		client: socket.socket = conn_info.get("client")
-		syn_packet = self._receive_packet(client, conn_info)
-		if syn_packet is None or syn_packet.get("flags") != SYN:
-			return False
-		conn_info.update({"packet_size": syn_packet.get("packet_size")})
+		address = packet_data[0]
+		conn_info = self.active_conns.get(address)
+		packet_data = packet_data[1]
+		# print(f"outgoing: {len(packet_data[3])}")
+		try:
+			self._send_packet(conn_info, packet_data[3], syn=packet_data[2], flags=packet_data[4])
+		except (BrokenPipeError, OSError):
+			self.clear_connection.put(address)
+			return
+		if len(packet_data) < 6:
+			packet_data = [
+				True,
+				False,
+				packet_data[2],
+				packet_data[3],
+				packet_data[4],
+				time.time(),
+				1
+			]
+		else:
+			packet_data = [
+				True,
+				False,
+				packet_data[2],
+				packet_data[3],
+				packet_data[4],
+				time.time(),
+				packet_data[5] + 1
+			]
+		self.outgoing_data[index] = [address, packet_data]
+
+	def _check_for_ack_packets(self, packet_data, index):
+		address = packet_data[0]
+		packet_data = packet_data[1]
+		ack_expected = packet_data[2] + len(packet_data[3])
+		if ack_expected > 9999999:
+			ack_expected = ack_expected - 9999999
+		ack_in = self.ack_received.get(address)
+		# print(f"ACK IN: {ack_in}")
+		 #print(f"ACK EXPECTED: {ack_expected}")
+		if time.time() - 10 <= packet_data[5]:
+			if ack_in is not None and ack_expected in ack_in:
+				self.outgoing_data[index][1][1] = True
+				ack_in.remove(ack_expected)
+				self.ack_received.update({address: ack_in})
+		elif self.outgoing_data[index][1][6] < 3 and time.time() - 10 > packet_data[6]:
+			self.outgoing_data[index][1][0] = False
+			self.outgoing_data[index][1][5] = time.time()
+		else:
+			print([f"[CONNECTION TIMED OUT TO {address}]"])
+			self.clear_connection.put(address)
+
+	def _handshake0(self, syn_packet) -> bool:
+		conn_info = {
+			"conn_step": 0,
+			"address": syn_packet.get("address"),
+			"packet_size": syn_packet.get("packet_size"),
+			"syn_seq": randint(0, 9999990),
+			"ack_seq": syn_packet.get("syn_seq"),
+			"packet_dict": {},
+			"partial_msg_buffer": "",
+			"msg_in_queue": Queue(),
+			"dropped_packets": [0, 0.0]
+		}
 		ack_seq = syn_packet.get("syn_seq")
-		conn_info.update({"ack_seq": ack_seq})
 		try:
 			self._send_packet(conn_info=conn_info, flags=SYN_ACK, ack=ack_seq + 1)
 		except BrokenPipeError:
+			self.clear_connection.put(syn_packet.get("address"))
 			return False
-		ack_packet = self._receive_packet(client, conn_info)
-		if ack_packet is None or \
-			ack_packet.get("ack_seq") != (conn_info.get("syn_seq")+1) or \
-			ack_packet.get("flags") != ACK:
-			return False
+		self.active_conns.update({conn_info.get("address"): conn_info})
 		return True
 
-	def _handshake_init(self, conn_info) -> bool:
-		client: socket.socket = conn_info.get("client")
+	def _handshake1(self, ack_packet) -> bool:
+		conn_info = self.active_conns.get(ack_packet.get("address"))
+		if ack_packet.get("ack_seq") != (conn_info.get("syn_seq")+1) or \
+			ack_packet.get("flags") != ACK:
+			self.clear_connection.put(ack_packet.get("address"))
+			return False
+		conn_info.update({"conn_step": 1})
+		self.active_conns.update({ack_packet.get("address"): conn_info})
+		print(f'{[ack_packet.get("address")]} CONNECTED SUCCESSFULLY')
+		return True
+
+	def _handshake_init0(self, address) -> bool:
+		conn_info = {
+			"conn_step": 0,
+			"address": address,
+			"packet_size": HEADER_SIZE,
+			"syn_seq": randint(0, 9999990),
+			"ack_seq": 0,
+			"packet_dict": {},
+			"partial_msg_buffer": "",
+			"msg_in_queue": Queue(),
+			"dropped_packets": [0, 0.0]
+		}
 		self._send_packet(conn_info, flags=SYN)
-		syn_ack = self._receive_packet(client, conn_info)
-		if syn_ack is None:
+		self.active_conns.update({address: conn_info})
+		return True
+
+	def _handshake_init1(self, syn_ack_packet) -> bool:
+		conn_info = self.active_conns.get(syn_ack_packet.get("address"))
+		if syn_ack_packet.get("ack_seq") != conn_info.get("syn_seq") + 1:
+			self.clear_connection.put(syn_ack_packet.get("address"))
 			return False
-		if syn_ack.get("flags") != SYN_ACK or syn_ack.get("ack_seq") != conn_info.get("syn_seq") + 1:
-			return False
-		conn_info.update({"packet_size": syn_ack.get("packet_size")})
-		ack_seq = syn_ack.get("syn_seq")
+		conn_info.update({"packet_size": syn_ack_packet.get("packet_size")})
+		ack_seq = syn_ack_packet.get("syn_seq")
 		conn_info.update({"ack_seq": ack_seq})
+		conn_info.update({"conn_step": 1})
+		self.active_conns.update({syn_ack_packet.get("address"): conn_info})
 		self._send_packet(conn_info, flags=ACK, ack=ack_seq + 1)
 		return True
 
-	def _receive_packet(self, client: socket.socket, conn_info: dict):
-		raw_data = client.recv(conn_info.get("packet_size")).decode("utf-8")
-		raw_data = verify_checksum(raw_data)
+	def _receive_packet(self):
+		raw_data, address = self.server.recvfrom(TRANSMISSION_SIZE)
+		raw_data = verify_checksum(raw_data.decode("utf-8"))
 		if raw_data is None:
 			return None
+		# print(f"data recv: {raw_data}")
 		data = {
-			"flags": raw_data[0:3],
-			"packet_size": int(raw_data[3:5]),
-			"syn_seq": int(raw_data[5:12]),
-			"ack_seq": int(raw_data[12:19]),
+			"address": address,
+			"flags": raw_data[0:FLAG_SIZE],
+			"packet_size": int(raw_data[FLAG_SIZE:(FLAG_SIZE+BUFFER_SIZE)]),
+			"syn_seq": int(raw_data[(FLAG_SIZE+BUFFER_SIZE):(FLAG_SIZE+BUFFER_SIZE+SEQ_SIZE)]),
+			"ack_seq": int(raw_data[(FLAG_SIZE+BUFFER_SIZE+SEQ_SIZE):HEADER_SIZE]),
 			"msg": raw_data[HEADER_SIZE:].rstrip()
 		}
-		print (f"recv: {data}")
 		return data
 
 	def _send_packet(
@@ -353,12 +496,12 @@ class Connection():
 		syn: int = -1,
 		ack: int = -1
 	) -> bytes:
-		packet = f'{flags:<0{FLAG_SIZE}}{PACKET_SIZE+CHECKSUM_SIZE:0{BUFFER_SIZE}}'
+		packet = f'{flags:<0{FLAG_SIZE}}{TRANSMISSION_SIZE:0{BUFFER_SIZE}}'
 
 		if syn != -1:
-			packet += f'{syn:0{SYN_SIZE}}'
+			packet += f'{syn:0{SEQ_SIZE}}'
 		else:
-			packet += f'{conn_info.get("syn_seq"):0{SYN_SIZE}}'
+			packet += f'{conn_info.get("syn_seq"):0{SEQ_SIZE}}'
 		if ack != -1:
 			packet += f'{ack:0{ACK_SIZE}}'
 		else:
@@ -366,17 +509,12 @@ class Connection():
 		if msg != '':
 			packet += f'{msg:<{MSG_SIZE}}'
 
-		print (f"send: {packet}")
-
 		packet = create_checksum(packet)
-		client = conn_info.get("client")
-		client.send(packet.encode('utf-8'))
+		self.server.sendto(packet.encode('utf-8'), conn_info.get("address"))
 
 	def _clear_inactive_client(self, address):
-		conn_info = self.active_conns.get(address)
-		client = conn_info.get("client")
-		self.active_sockets.remove(client)
-		self.active_conns.pop(address)
-		self.raw_outgoing_data = [x for x in self.raw_outgoing_data if x[0] != address]
-		self.outgoing_data = [x for x in self.outgoing_data if x[0] != address]
-		print(f"[{address} HAS DISCONNECTED]")
+		if address in self.active_conns:
+			self.active_conns.pop(address)
+			self.raw_outgoing_data = [x for x in self.raw_outgoing_data if x[0] != address]
+			self.outgoing_data = [x for x in self.outgoing_data if x[0] != address]
+			print(f"[{address} HAS DISCONNECTED]")
