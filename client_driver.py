@@ -4,9 +4,9 @@ import queue
 from network import Connection
 
 
-SERVER1 = ("71.249.121.62", 8052)
-SERVER2 = ("71.249.121.62", 8053)
-SERVER3 = ("71.249.121.62", 8054)
+SERVER1 = ("192.168.1.108", 8052)
+SERVER2 = ("192.168.1.108", 8053)
+SERVER3 = ("192.168.1.108", 8054)
 
 def main():
 	server = Connection()

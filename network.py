@@ -35,9 +35,10 @@ SEQ_SIZE = 7
 ACK_SIZE = 7
 MSG_SIZE = 17
 CHUNK_SIZE = 100
+SEP_SIZE = 3
 
 HEADER_SIZE = FLAG_SIZE + BUFFER_SIZE + SEQ_SIZE + ACK_SIZE
-PACKET_SIZE = HEADER_SIZE + MSG_SIZE
+PACKET_SIZE = HEADER_SIZE + MSG_SIZE + SEP_SIZE
 TRANSMISSION_SIZE = PACKET_SIZE + CHECKSUM_SIZE
 
 SYN = "0000"
@@ -49,6 +50,9 @@ DATA_REQUEST = "0101"
 DATA_REQUEST_R = "0110"
 DATA = "0111"
 FIN = "1000"
+
+PACKET_END = "<|>"
+MSG_END = "!#!#!#"
 
 def create_checksum(packet: str) -> str:
 	if len(packet) < HEADER_SIZE:
@@ -81,6 +85,7 @@ def verify_checksum(packet: str) -> str:
 		return packet
 	return None
 
+
 class Connection():
 	def __init__(self):
 		self.server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
@@ -109,7 +114,17 @@ class Connection():
 			return
 		for address in self.active_conns:
 			self.raw_outgoing_data.append([address, f_name, DATA_CHECK])
-			self.data_requests.update({f_name: [0, time.time(), [], 0, dict(), None]})
+		num_conns = len(self.active_conns)
+		self.data_requests.update({
+			f_name: {
+				"req_step": 0,
+				"file_size": 0,
+				"time_started": time.time(),
+				"num_conns": num_conns,
+				"replies": [],
+				"data": dict()
+			}
+		})
 
 	def recv_req(self, f_name: str):
 		if f_name in self.data_requests:
@@ -117,11 +132,10 @@ class Connection():
 			if data[0] == -1:
 				print("[ERROR RECEIVING DATA]")
 				return None
-			elif data[0] == 5:
+			if data[0] == 5:
 				return data[0]
-			else:
-				print("[REQUEST IN PROGRESS]")
-				return None
+			print("[REQUEST IN PROGRESS]")
+			return None
 		print ("[REQUEST NOT FOUND]")
 		return None
 
@@ -215,15 +229,13 @@ class Connection():
 
 	def _process_data_packet(self, data) -> int:
 		conn_info = self.active_conns.get(data.get("address"))
-		try:
-			self._send_packet(
-				flags=ACK,
-				ack=data.get("syn_seq") + len(data.get("msg")),
-				conn_info=conn_info
-			)
-		except (BrokenPipeError, OSError):
-			self.clear_connection.put(conn_info.get("address"))
-			return 0
+		self._send_packet(
+			flags=ACK,
+			ack=data.get("syn_seq") + len(data.get("msg")),
+			conn_info=conn_info
+		)
+		self.clear_connection.put(conn_info.get("address"))
+
 		packet_dict = conn_info.get("packet_dict")
 		partial_msg_buffer = conn_info.get("partial_msg_buffer")
 		msg_in_queue = conn_info.get("msg_in_queue")
@@ -233,19 +245,14 @@ class Connection():
 			if conn_info.get("ack_seq") in packet_dict:
 				data = packet_dict.get(conn_info.get("ack_seq"))
 				msg = data.get("msg")
-				# print(f"incoming: {len(msg)}")
-				if msg != "!#!#!#":
-					partial_msg_buffer += msg
-					# print(f"partials: {partial_msg_buffer}")
-				else:
-					complete_msg = partial_msg_buffer.replace("/$%/", " ")
-					# print (f"complete: {complete_msg}")
+				partial_msg_buffer += msg
+				index = partial_msg_buffer.find("!#!#!#")
+				if index != -1:
+					complete_msg = partial_msg_buffer[0:index]
 					if data.get("flags") == DATA:
 						msg_in_queue.put(complete_msg)
-						# print(f"data complete msg: {complete_msg}")
 					else:
 						self.data_requests_r.append([data.get("address"), data.get("flags"), complete_msg])
-						# print(f"complete msg: {complete_msg}")
 					partial_msg_buffer = ""
 				conn_info.update({"ack_seq": data.get("syn_seq") + len(msg)})
 			else:
@@ -276,36 +283,40 @@ class Connection():
 				else:
 					msg = file_path + " 0"
 					self.raw_outgoing_data.append([request[0], msg, DATA_CHECK_R])
+
 			elif request[1] == DATA_CHECK_R:
 				msg = request[2].split()
 				req = self.data_requests.get(msg[0])
-				if int(msg[1]) != 0 and time.time() - req[1] < 10:
-					req[2].append(request[0])
-					req[3] = int(msg[1])
+				address_list = req.get("replies")
+				if int(msg[1]) != 0 and time.time() - req.get("time_started") < 10:
+					address_list.append(request[0])
+					req.update({"replies": address_list})
+					req.update({"file_size":int(msg[1])})
+					req.update({"num_conns": req.get("num_conns") - 1})
 
 			elif request[1] == DATA_REQUEST:
 				msg = request[2].split()
 				file = open(msg[0], "rt")
 				data = file.read(int(msg[1]))
 				data = file.read(int(msg[2]))
-				if not file.readline():
-					data = data.rstrip()
 				data = msg[0] + " " + msg[1] + " " + msg[2] + " " + data
-				# print(f"sending: {data}\nlength: {len(data)}")
 				self.raw_outgoing_data.append([request[0], data, DATA_REQUEST_R])
+
 			elif request[1] == DATA_REQUEST_R:
 				msg = request[2].split(" ", 3)
-				# print(f"msg after split: {msg}")
 				req = self.data_requests.get(msg[0])
-				if time.time() - float(req[1]) < 20:
-					req[4].update({int(msg[1]): msg[3]})
+				data = req.get("data")
+				if time.time() - float(req.get("time_started")) < 10:
+					data.update({int(msg[1]): msg[3]})
+					req.update({"data": data})
 				self.data_requests.update({msg[0]: req})
-				chunks = ceil(req[3]/CHUNK_SIZE)
-				if len(req[4]) == chunks:
+				chunks = ceil(req.get("file_size")/CHUNK_SIZE)
+				if len(req.get("data")) == chunks:
 					counter = 0
 					msg = ""
+					data = req.get("data")
 					while counter < chunks:
-						msg += req[4].get(counter*CHUNK_SIZE)
+						msg += data.get(counter*CHUNK_SIZE)
 						counter += 1
 					file = open("./README2.md", "w")
 					file.write(msg)
@@ -314,20 +325,22 @@ class Connection():
 
 		for i in self.data_requests:
 			req = self.data_requests.get(i)
-			if time.time() - req[1] > 10 and len(req[2]) != 0 and req[0] == 0:
-				chunks = ceil(req[3]/CHUNK_SIZE)
-				addresses = len(req[2])
-				chunk_counter = 0
-				address_counter = 0
-				while chunk_counter < chunks:
-					msg = i + " " + str(CHUNK_SIZE*chunk_counter) + " " + str(CHUNK_SIZE)
-					self.raw_outgoing_data.append([req[2][address_counter], msg, DATA_REQUEST])
-					chunk_counter += 1
-					address_counter += 1
-					if address_counter == addresses:
-						address_counter = 0
-				req[0] = 1
-				req[1] = time.time()
+			if time.time() - req.get("time_started") > 10 or req.get("num_conncs") == 0:
+				if len(req.get("replies")) != 0 and req.get("req_step") == 0:
+					chunks = ceil(req.get("file_size")/CHUNK_SIZE)
+					addresses = len(req.get("replies"))
+					address_list = req.get("replies")
+					chunk_counter = 0
+					address_counter = 0
+					while chunk_counter < chunks:
+						msg = i + " " + str(CHUNK_SIZE*chunk_counter) + " " + str(CHUNK_SIZE)
+						self.raw_outgoing_data.append([address_list[address_counter], msg, DATA_REQUEST])
+						chunk_counter += 1
+						address_counter += 1
+						if address_counter == addresses:
+							address_counter = 0
+					req.update({"req_step": 1})
+					req.update({"time_started": time.time()})
 			self.data_requests.update({i: req})
 
 	def _format_outgoing_data(self):
@@ -335,7 +348,7 @@ class Connection():
 			conn_info = self.active_conns.get(data[0])
 			msg = data[1]
 			syn = conn_info.get("syn_seq")
-			msg = msg.replace(" ", "/$%/")
+			msg = msg + MSG_END
 			loop_range = ceil(len(msg) / MSG_SIZE) - 1
 			for i in range(loop_range):
 				msg_slice = msg[(MSG_SIZE * i):MSG_SIZE * (i + 1)]
@@ -346,10 +359,6 @@ class Connection():
 			msg_slice = msg[((loop_range) * MSG_SIZE):]
 			self.outgoing_data.append([data[0], [False, False, syn, msg_slice, data[2]]])
 			syn += len(msg_slice)
-			if syn > 9999999:
-				syn = syn - 9999999
-			self.outgoing_data.append([data[0], [False, False, syn, "!#!#!#", data[2]]])
-			syn += 6
 			if syn > 9999999:
 				syn = syn - 9999999
 			conn_info.update({"syn_seq": syn})
@@ -363,11 +372,7 @@ class Connection():
 		conn_info = self.active_conns.get(address)
 		packet_data = packet_data[1]
 		# print(f"outgoing: {len(packet_data[3])}")
-		try:
-			self._send_packet(conn_info, packet_data[3], syn=packet_data[2], flags=packet_data[4])
-		except (BrokenPipeError, OSError):
-			self.clear_connection.put(address)
-			return
+		self._send_packet(conn_info, packet_data[3], syn=packet_data[2], flags=packet_data[4])
 		if len(packet_data) < 6:
 			packet_data = [
 				True,
@@ -397,8 +402,6 @@ class Connection():
 		if ack_expected > 9999999:
 			ack_expected = ack_expected - 9999999
 		ack_in = self.ack_received.get(address)
-		# print(f"ACK IN: {ack_in}")
-		 #print(f"ACK EXPECTED: {ack_expected}")
 		if time.time() - 10 <= packet_data[5]:
 			if ack_in is not None and ack_expected in ack_in:
 				self.outgoing_data[index][1][1] = True
@@ -424,11 +427,7 @@ class Connection():
 			"dropped_packets": [0, 0.0]
 		}
 		ack_seq = syn_packet.get("syn_seq")
-		try:
-			self._send_packet(conn_info=conn_info, flags=SYN_ACK, ack=ack_seq + 1)
-		except BrokenPipeError:
-			self.clear_connection.put(syn_packet.get("address"))
-			return False
+		self._send_packet(conn_info=conn_info, flags=SYN_ACK, ack=ack_seq + 1)
 		self.active_conns.update({conn_info.get("address"): conn_info})
 		return True
 
@@ -477,14 +476,15 @@ class Connection():
 		raw_data = verify_checksum(raw_data.decode("utf-8"))
 		if raw_data is None:
 			return None
-		# print(f"data recv: {raw_data}")
+		msg = raw_data[HEADER_SIZE:].rstrip()
+		msg = msg[:(len(msg)-SEP_SIZE)]
 		data = {
 			"address": address,
 			"flags": raw_data[0:FLAG_SIZE],
 			"packet_size": int(raw_data[FLAG_SIZE:(FLAG_SIZE+BUFFER_SIZE)]),
 			"syn_seq": int(raw_data[(FLAG_SIZE+BUFFER_SIZE):(FLAG_SIZE+BUFFER_SIZE+SEQ_SIZE)]),
 			"ack_seq": int(raw_data[(FLAG_SIZE+BUFFER_SIZE+SEQ_SIZE):HEADER_SIZE]),
-			"msg": raw_data[HEADER_SIZE:].rstrip()
+			"msg": msg
 		}
 		return data
 
@@ -507,7 +507,8 @@ class Connection():
 		else:
 			packet += f'{conn_info.get("ack_seq"):0{ACK_SIZE}}'
 		if msg != '':
-			packet += f'{msg:<{MSG_SIZE}}'
+			msg += PACKET_END
+			packet += f'{msg:<{MSG_SIZE + 3}}'
 
 		packet = create_checksum(packet)
 		self.server.sendto(packet.encode('utf-8'), conn_info.get("address"))
