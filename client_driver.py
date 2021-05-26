@@ -4,18 +4,17 @@ import queue
 from network import Connection
 
 
-SERVER1 = ("192.168.1.108", 8052)
-SERVER2 = ("192.168.1.108", 8053)
-SERVER3 = ("192.168.1.108", 8054)
+SERVER1 = ("192.168.1.108", 8050)
+SERVER2 = ("192.168.1.108", 8051)
+SERVER3 = ("192.168.1.108", 8052)
 
 def main():
 	server = Connection()
 	server.connect(SERVER1)
-	server.connect(SERVER2)
-	server.connect(SERVER3)
+	#server.connect(SERVER2)
+	#server.connect(SERVER3)
 	incoming_message_thread = Thread(target=print_incoming_message, args=(server,))
 	incoming_message_thread.start()
-	server.send_req("./README.md")
 	while True:
 		clients = server.get_clients()
 		for client in clients:

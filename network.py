@@ -122,7 +122,8 @@ class Connection():
 				"time_started": time.time(),
 				"num_conns": num_conns,
 				"replies": [],
-				"data": dict()
+				"data": dict(),
+				"chunks_req": dict()
 			}
 		})
 
@@ -173,13 +174,10 @@ class Connection():
 		while True:
 			# check if packet incoming
 			ready_sockets, _, _ = select([self.server], [], [], 0)
+
 			# process incoming packet
 			if len(ready_sockets) != 0:
-				data = self._receive_packet()
-				if data is None:
-					continue
-				if data.get("address") in self.active_conns or self.listening:
-					self._sort_incoming_packets(data)
+				self._sort_incoming_packets()
 
 			# process data requests
 			if len(self.data_requests) != 0 or len(self.data_requests_r) != 0:
@@ -197,16 +195,21 @@ class Connection():
 					# check for ack packets
 					elif packet_data[1][0] and not packet_data[1][1]:
 						self._check_for_ack_packets(packet_data, i)
+				# clear acknowledged packets
 				self.outgoing_data = [x for x in self.outgoing_data if not x[1][0] or not x[1][1]]
 
 			# terminate problematic connections
 			while not self.clear_connection.empty():
 				self._clear_inactive_client(self.clear_connection.get())
 
-			time.sleep(.01)
+		time.sleep(.001)
 
 	# helper functions
-	def _sort_incoming_packets(self, data):
+	def _sort_incoming_packets(self):
+		data = self._receive_packet()
+		if (data is None) or (data.get("address") not in self.active_conns and not self.listening):
+			return
+
 		if data.get("address") in self.active_conns:
 			conn_info = self.active_conns.get(data.get("address"))
 			flags = data.get("flags")
@@ -227,19 +230,22 @@ class Connection():
 		elif data.get("flags") == SYN and self.listening and not self._handshake0(data):
 			print("[ATTEMPTED CONNECTION FAILED]")
 
-	def _process_data_packet(self, data) -> int:
+	def _process_data_packet(self, data):
+		# pull connection info
 		conn_info = self.active_conns.get(data.get("address"))
+
+		# send ACK packet
 		self._send_packet(
 			flags=ACK,
 			ack=data.get("syn_seq") + len(data.get("msg")),
 			conn_info=conn_info
 		)
-		self.clear_connection.put(conn_info.get("address"))
 
 		packet_dict = conn_info.get("packet_dict")
 		partial_msg_buffer = conn_info.get("partial_msg_buffer")
 		msg_in_queue = conn_info.get("msg_in_queue")
 		packet_dict.update({data.get("syn_seq"): data})
+
 		# recreate message from packet
 		while True:
 			if conn_info.get("ack_seq") in packet_dict:
@@ -257,20 +263,19 @@ class Connection():
 				conn_info.update({"ack_seq": data.get("syn_seq") + len(msg)})
 			else:
 				break
+
+		# update connection info
 		conn_info.update({"packet_dict": packet_dict})
 		conn_info.update({"partial_msg_buffer": partial_msg_buffer})
 		conn_info.update({"msg_in_queue": msg_in_queue})
 
-		return 1
-
-	def _process_ack_packet(self, data) -> int:
+	def _process_ack_packet(self, data):
+		# sort ack packet for correct connection
 		ack_in = set()
 		if data.get("address") in self.ack_received:
 			ack_in = self.ack_received.get(data.get("address"))
 		ack_in.add(data.get("ack_seq"))
 		self.ack_received.update({data.get("address"): ack_in})
-
-		return 1
 
 	def _process_data_requests(self):
 		for request in self.data_requests_r:
@@ -304,11 +309,13 @@ class Connection():
 
 			elif request[1] == DATA_REQUEST_R:
 				msg = request[2].split(" ", 3)
+				print (msg)
 				req = self.data_requests.get(msg[0])
 				data = req.get("data")
 				if time.time() - float(req.get("time_started")) < 10:
 					data.update({int(msg[1]): msg[3]})
 					req.update({"data": data})
+					req.update({"time_started": time.time()})
 				self.data_requests.update({msg[0]: req})
 				chunks = ceil(req.get("file_size")/CHUNK_SIZE)
 				if len(req.get("data")) == chunks:
@@ -325,22 +332,56 @@ class Connection():
 
 		for i in self.data_requests:
 			req = self.data_requests.get(i)
-			if time.time() - req.get("time_started") > 10 or req.get("num_conncs") == 0:
+			if time.time() - req.get("time_started") > 10 or req.get("num_conns") == 0:
 				if len(req.get("replies")) != 0 and req.get("req_step") == 0:
 					chunks = ceil(req.get("file_size")/CHUNK_SIZE)
-					addresses = len(req.get("replies"))
+					address_count = len(req.get("replies"))
 					address_list = req.get("replies")
 					chunk_counter = 0
 					address_counter = 0
 					while chunk_counter < chunks:
 						msg = i + " " + str(CHUNK_SIZE*chunk_counter) + " " + str(CHUNK_SIZE)
 						self.raw_outgoing_data.append([address_list[address_counter], msg, DATA_REQUEST])
+						chunks_req = req.get("chunks_req")
+						if address_list[address_counter] in chunks_req:
+							chunk_list = chunks_req.get(address_list[address_counter])
+							chunk_list.append(CHUNK_SIZE*chunk_counter)
+							chunks_req.update({address_list[address_counter]: chunk_list})
+						else:
+							chunk_list = [CHUNK_SIZE*chunk_counter]
+							chunks_req.update({address_list[address_counter]: chunk_list})
+						req.update({"chunks_req": chunks_req})
 						chunk_counter += 1
 						address_counter += 1
-						if address_counter == addresses:
+						if address_counter == address_count:
 							address_counter = 0
 					req.update({"req_step": 1})
 					req.update({"time_started": time.time()})
+			if req.get("req_step") == 1 and (time.time() - req.get("time_started")) > 10:
+				chunks = ceil(req.get("file_size")/CHUNK_SIZE)
+				data = req.get("data")
+				chunks_req = req.get("chunks_req")
+				missing_chunks = []
+				address_list = req.get("replies")
+				for j in range(chunks):
+					if (j*CHUNK_SIZE) not in data:
+						missing_chunks.append(j*CHUNK_SIZE)
+				for j in missing_chunks:
+					for k in address_list:
+						msg = i + " " + str(j) + " " + str(CHUNK_SIZE)
+						if k in chunks_req:
+							chunk_list = chunks_req.get(k)
+							if j not in chunk_list:
+								self.raw_outgoing_data.append([k, msg, DATA_REQUEST])
+								chunk_list.append(j)
+								chunks_req.update({k: chunk_list})
+								break
+						self.raw_outgoing_data.append([k, msg, DATA_REQUEST])
+						chunks_req.update({k: [j]})
+						break
+				req.update({"chunks_req": chunks_req})
+				req.update({"time_started": time.time()})
+
 			self.data_requests.update({i: req})
 
 	def _format_outgoing_data(self):
@@ -364,14 +405,12 @@ class Connection():
 			conn_info.update({"syn_seq": syn})
 			self.active_conns.update({data[0]: conn_info})
 		self.raw_outgoing_data.clear()
-		# print(self.outgoing_data)
 
 	def _send_outgoing_data(self, packet_data, index):
 
 		address = packet_data[0]
 		conn_info = self.active_conns.get(address)
 		packet_data = packet_data[1]
-		# print(f"outgoing: {len(packet_data[3])}")
 		self._send_packet(conn_info, packet_data[3], syn=packet_data[2], flags=packet_data[4])
 		if len(packet_data) < 6:
 			packet_data = [

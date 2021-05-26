@@ -5,7 +5,7 @@ from network import Connection
 
 def main():
 	server = Connection()
-	server.listen(8054)
+	server.listen(8050)
 	incoming_message_thread = Thread(target=print_incoming_message, args=(server,))
 	incoming_message_thread.start()
 	while True:
